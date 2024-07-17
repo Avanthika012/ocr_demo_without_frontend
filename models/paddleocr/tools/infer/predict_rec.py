@@ -832,10 +832,12 @@ class PaddleOCRx():
             logger.info(E)
             exit()
         
-        generated_text = rec_resx[0][0] ###rec_res: [('17:25', 0.9999982714653015)]
+        # generated_text = rec_resx[0][0] ###rec_res: [('17:25', 0.9999982714653015)]
+        generated_text,score = rec_resx[0][0], rec_resx[0][1]###rec_res: [('17:25', 0.9999982714653015)]
+
         
 
-        return generated_text
+        return generated_text,score
 
     # Method to call for direct inferencing
     def __call__(self, image):
@@ -848,9 +850,9 @@ class PaddleOCRx():
         Returns:
             tuple: Bounding boxes, class names, and confidence scores of detected objects.
         """
-        text = self.ocrx(image)
+        text,score = self.ocrx(image)
 
-        return text
+        return text,score
 
 
 

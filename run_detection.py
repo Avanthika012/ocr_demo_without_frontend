@@ -1,239 +1,335 @@
-import os 
-import torch
-import cv2
-import json
-import time 
-from models.yolov8_model import YoloV8
-from models.fasterrcnn_inference import FasterRCNN
-# from models.trocr_inference import TROCR
-from models.paddleocr.tools.infer.predict_rec import PaddleOCRx
 
-import argparse
-import traceback
-from tqdm import tqdm 
+import torch
+import time 
+import cv2
+import random
 import datetime
+import traceback
+import os 
 import sys
+import json
+from tqdm import tqdm 
+import math
+import PIL
+
+
+
+
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
-from models.create_colors import Colors  
-colors = Colors()  # create instance for 'from utils.plots import colors'
+sys.path.append(os.path.join(os.path.dirname(__file__), 'models'))
+
+from models.fasterrcnn_inference import FasterRCNN
+from models.paddleocr.tools.infer.predict_rec import PaddleOCRx
+# Get the logger
+from logger_setup import get_logger
+logger = get_logger(__name__, "ocr.log", console_output=True)
 
 
-def dirchecks(file_path):
-    if not os.path.exists(file_path):
-        print(f"[INFO] {datetime.datetime.now()}: Can not find this directory:\n{file_path}. Please check.\n Exiting!!!!\n")
-        sys.exit(1)
-    else:
-        print(f"[INFO] {datetime.datetime.now()}: Found this directory:\n{file_path}.\n")
+# from models.create_colors import Colors  
+# colors = Colors()  # create instance for 'from utils.plots import colors'
+
+### ocr code 
+class OCR():
+
+    def __init__(self,params,logger,res_path="./results"):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def save_cropped_image(image, crop_box, output_dir, base_name, crop_index):
-    x1, y1, x2, y2 = crop_box
-    crop_img = image[y1:y2, x1:x2]
-    crop_filename = os.path.join(output_dir, f"{base_name}_crop_{crop_index}.png")
-    cv2.imwrite(crop_filename, crop_img)
-    print(f"[INFO] {datetime.datetime.now()}: Cropped image saved at {crop_filename}")
+        ### loading the model
+        if params["use_model"] == "fasterrcnn":
+            self.model = FasterRCNN(model_weights=params["models"]["fasterrcnn"]["model_weights"], classes=params["classes"], device=self.device, detection_thr=params["models"]["fasterrcnn"]["det_th"])
+            self.det_th = params["models"]["fasterrcnn"]["det_th"]
+            print(f"FasterRCNN model created!!!")
+
+        else:
+            self.model = None
+        if params["use_ocr_model"] == "paddleocr":
+            print(f"__init__ OCR: initiating PaddleOCRx")
+            self.ocr_model = PaddleOCRx(model_weights=params["ocr_models"]["paddleocr"]["model_weights"])
+            print(f"PaddleOCRx model created for text RECOG task!!!")
+
+        else:
+            self.ocr_model = None
+
+        self.drop_score = 0.5
+        self.logger = logger
+        
+        self.draw_img_save_dir =  res_path
+        os.makedirs(self.draw_img_save_dir, exist_ok=True)
 
 
-def plot_results(img, boxes, class_names, scores, det_th, classes, ocr_model, crop_output_dir, img_name, results_file):
-    print(f"[INFO] {datetime.datetime.now()}: detections: boxes:{boxes}\n, class_names:{class_names}\n, scores:{scores}\n, det_th:{det_th}\n")
+    def __call__(self,image,img_name=None, manualEntryx=None):
+        st = time.time()
+        ### -------- TEXT DETECTION --------
+        boxes, class_names, scores = self.model(image)
+        # print(f"[INFO] {datetime.datetime.now()}: time taken for text detection {time.time() - st } seconds")
+        self.logger.info(f"[INFO] time taken for text detection {time.time() - st } seconds x {len(class_names)} no. of texts detected!!!")
+        detected_texts = []
+        detection_scores = []
+        detected_bboxes = []
 
-    for i in range(len(class_names)): 
-        if scores[i] >= det_th: 
-            x1, y1, x2, y2 = boxes[i]
-            cname = class_names[i]
+        ### looping through all detected BBoxes or texts on an image
+        for i in range(len(class_names)): 
+            if scores[i]>=self.det_th: 
+                # x1,y1,x2,y2 = boxes[i]
+                x1,y1,x2,y2  = self.increase_bbox_area_lengthwise(boxes[i])
+                x1,y1,x2,y2 = int(x1),int(y1),int(x2),int(y2)
+                cname= class_names[i]
+                detected_bboxes.append([int(x1),int(y1),int(x2),int(y2) ])
 
-            # Save cropped images
-            save_cropped_image(img, (x1, y1, x2, y2), crop_output_dir, img_name, i)
+                #### --------    OCR WORK    ----------------
+                if self.ocr_model !=None:
+                    cropped_image = image[y1:y2, x1:x2]
 
-            #### --------    OCR WORK    ----------------
-            if ocr_model is not None:
-                cropped_image = img[y1:y2, x1:x2]
-                st = time.time() 
-                ocr_text = ocr_model(cropped_image)
-                print(f"[INFO] {datetime.datetime.now()}: time taken for text recognition {time.time() - st } seconds")
-                print(f"------------------------------ ocr_text:{ocr_text}")
+                    st = time.time() 
+                    ocr_text,score = self.ocr_model(cropped_image)
+                    detected_texts.append(ocr_text)
+                    detection_scores.append(score)
+                    
+                    # print(f"[INFO] {datetime.datetime.now()}: time taken for text recognition {time.time() - st }  seconds")
+                    self.logger.info(f"[INFO] time taken for text recognition {time.time() - st } seconds x detected texts: {detected_texts} detection_scores:{detection_scores}")
 
-                # Save image name and OCR text to file
-                results_file.write(f"{img_name}_crop_{i}.png\t{ocr_text}\n")
+        ### plotting results and saving images 
+        draw_img = self.draw_ocr_box_txt(
+            image=Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)),
+            boxes=detected_bboxes,
+            txts=detected_texts,
+            scores=detection_scores,
+            drop_score=self.drop_score,
+            manualEntryx=manualEntryx
+        )
+        ### saving output image
+        img_save_name = os.path.join(self.draw_img_save_dir, img_name[:-4] if img_name != None else str(self.img_count))+".png"
+        cv2.imwrite(
+            img_save_name,
+            draw_img[:, :, ::-1],
+        )
+        self.logger.debug(
+            "The visualized image saved in {}".format(
+                img_save_name
+            )
+        )
 
-                ### if you want to put class name and recognised text without probability 
-                cv2.putText(img, cname + f" : {ocr_text}", (int(x1), int(y1)-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors(classes.index(cname)), 2)
-            else:  
-                ### if you want to put class name and probability 
-                cv2.putText(img, cname + f" {round(float(scores[i]),2)}", (int(x1), int(y1)-20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors(classes.index(cname)), 2)    
+        
+        return detected_texts,img_save_name
+    
 
-            ### plotting bboxes, class name and threshold 
-            cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), colors(classes.index(cname)), 2)  # BBox       
+    # def draw_ocr_box_txt(self,
+    #     image,
+    #     boxes,
+    #     txts=None,
+    #     scores=None,
+    #     drop_score=0.5,
+    #     font_path="./models/paddleocr/doc/fonts/simfang.ttf",
+    #     font_size_factor=5,
+    #     manualEntryx=None
+    # ):
+    #     # Validate the font_size_factor
+    #     if not (0.5 <= font_size_factor <= 10.0):
+    #         raise ValueError("font_size_factor should be between 0.5 and 10.0")
 
-    return img  # all bounding boxes are plotted on this image
+    #     h, w = image.height, image.width
+    #     font = ImageFont.truetype(font_path, int(20 * font_size_factor))
 
+    #     # Filter out texts based on scores
+    #     valid_texts = [txt for idx, txt in enumerate(txts) if scores is None or scores[idx] >= drop_score]
 
-def img_inferencing(image_dir, out_path, ocr_model, model, det_th, custom_name, classes):
-    print(f"[INFO] {datetime.datetime.now()}: --------- IMAGE INFERENCING STARTED --------- \n")
+    #     img_show = image.copy()
 
-    ### creating output paths
-    out_img_path = f"{out_path}/img_out/{custom_name}"
-    out_crop_path = f"{out_img_path}/crops"
-    os.makedirs(out_img_path, exist_ok=True)
-    os.makedirs(out_crop_path, exist_ok=True)
-    print(f"[INFO] {datetime.datetime.now()}: output paths created.")
+    #     if manualEntryx is not None:
+    #         manual_entries = manualEntryx.strip().lower()  # Normalize to lower case
+    #     else:
+    #         manual_entries = None
 
-    results_file_path = os.path.join(out_img_path, "results.txt")
-    with open(results_file_path, 'w') as results_file:
-        print(f"[INFO] {datetime.datetime.now()}: looping through all images.")
-        ### reading images and inferencing
-        for im_name in tqdm(os.listdir(image_dir)):
-            img_path = os.path.join(image_dir, im_name)
-            img = cv2.imread(img_path)
-            st = time.time()
-            boxes, class_names, scores = model(img)
-            print(f"[INFO] {datetime.datetime.now()}: time taken for text detection {time.time() - st } seconds")
+    #     print(f"Drawing on canvas : valid_texts:{valid_texts}")
 
-            ### filtering and plotting results on image
-            res_img = plot_results(img, boxes, class_names, scores, det_th, classes, ocr_model, out_crop_path, im_name, results_file)
+    #     pass_status = "Failed"
+    #     status_color = (255, 0, 0)  # Red for failed
 
-            ### saving output frames
-            cv2.imwrite(f"{out_img_path}/{im_name[:-4]}.png", res_img)
-            print(f"[INFO] {datetime.datetime.now()}: result img saved at {out_img_path}/{im_name[:-4]}.png res_img: {res_img.shape} \n ")
+    #     if manual_entries is not None:
+    #         for text in valid_texts:
+    #             normalized_text = text.strip().lower()
+    #             if any(char in manual_entries for char in normalized_text):
+    #                 pass_status = "Passed"
+    #                 status_color = (0, 255, 0)  # Green for passed
+    #                 break
 
-    print(f"[INFO] {datetime.datetime.now()}: --- IMAGE INFERENCING COMPLETED ---")
+    #     # Calculate new height for the status
+    #     line_height = 100  # Height of the line with some margin
+    #     new_h = img_show.height + line_height + 40  # Add some margin at the top
+    #     new_img = Image.new("RGB", (w, new_h), (0, 0, 0))  # Set background color to black
+    #     new_img.paste(img_show, (0, 0))
 
+    #     draw = ImageDraw.Draw(new_img)
+    #     y_offset = img_show.height + 20  # Start drawing text below the current image with some margin
 
-def vid_inferencing(folder_path, output_folder, model, det_th, custom_name, classes, ocr_model, lowfpsvid):
-    """
-    Process all videos in the specified folder using a detection algorithm on each frame.
+    #     # Draw the status text with color
+    #     draw.text((10, y_offset), pass_status, fill=status_color, font=font)
 
-    Args:
-    folder_path (str): The path to the folder containing videos.
-    output_folder (str): The path to the folder where processed video frames should be saved.
-                        If None, frames will not be saved.
-    """
-    print(f"[INFO] {datetime.datetime.now()}: --- VIDEO INFERENCING STARTED --- \n")
+    #     img_show = new_img  # Update the image with the newly created image
 
-    # Create the output folder if it doesn't exist
-    out_vid_path = f"{output_folder}/vid_out/{custom_name}"
-    out_crop_path = f"{out_vid_path}/crops"
-    os.makedirs(out_vid_path, exist_ok=True)
-    os.makedirs(out_crop_path, exist_ok=True)
-    print(f"[INFO] {datetime.datetime.now()}: output paths created.")
-
-    results_file_path = os.path.join(out_vid_path, "results.txt")
-    with open(results_file_path, 'w') as results_file:
-        # List all files in the folder_path
-        files = [f for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
-
-        # Process each file
-        for file in tqdm(files):
-            video_path = os.path.join(folder_path, file)
-            if not (video_path.endswith('.mp4') or video_path.endswith('.avi')):  # check for video files
+    #     return np.array(img_show)
+    def draw_ocr_box_txt(self,
+        image,
+        boxes,
+        txts=None,
+        scores=None,
+        drop_score=0.5,
+        font_path="./models/paddleocr/doc/fonts/simfang.ttf",
+        manualEntryx=None
+    ):
+        h, w = image.height, image.width
+        img_left = image.copy()
+        img_right = np.ones((h, w, 3), dtype=np.uint8) * 255
+        random.seed(0)
+        boxes = self.convert_bbox_format(boxes) ### converting into an array with dtype=float32 for polygon drawing
+        draw_left = ImageDraw.Draw(img_left)
+        if txts is None or len(txts) != len(boxes):
+            txts = [None] * len(boxes)
+        for idx, (box, txt) in enumerate(zip(boxes, txts)):
+            if scores is not None and scores[idx] < drop_score:
                 continue
+            color = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
 
-            # Capture video
-            cap = cv2.VideoCapture(video_path)
-            frame_width = int(cap.get(3))
-            frame_height = int(cap.get(4))
-            frame_rate = int(cap.get(5))
+            draw_left.polygon(box, fill=color)
+            img_right_text = self.draw_box_txt_fine((w, h), box, txt, font_path)
+            pts = np.array(box, np.int32).reshape((-1, 1, 2))
+            cv2.polylines(img_right_text, [pts], True, color, 1)
+            img_right = cv2.bitwise_and(img_right, img_right_text)
+        img_left = Image.blend(image, img_left, 0.5)
+        img_show = Image.new("RGB", (w * 2, h), (255, 255, 255))
+        img_show.paste(img_left, (0, 0, w, h))
+        img_show.paste(Image.fromarray(img_right), (w, 0, w * 2, h))
+        return np.array(img_show)
+    
+    def increase_bbox_area_lengthwise(self, bbox, factor=1.1):
+        """
+        Increase the bounding box area lengthwise by a given factor.
+        
+        Parameters:
+        bbox (list): A bounding box in [x1, y1, x2, y2] format.
+        factor (float): The factor by which to increase the length. Default is 1.1 (10% increase).
+        
+        Returns:
+        list: The adjusted bounding box in [x1, y1, x2, y2] format.
+        """
+        x1, y1, x2, y2 = bbox
+        width = x2 - x1
+        height = y2 - y1
 
-            # Prepare output video writer if output_folder is specified
-            if output_folder:
-                output_path = os.path.join(out_vid_path, f'result_{file}')
-                out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), frame_rate // 1, (frame_width, frame_height))
+        new_width = width * factor
+        new_height = height * factor
 
-                if lowfpsvid:
-                    output_path_low = os.path.join(out_vid_path, f'lowfpsresult_{file}')
-                    outlow = cv2.VideoWriter(output_path_low, cv2.VideoWriter_fourcc(*'mp4v'), frame_rate // 4, (frame_width, frame_height))
+        # Calculate new coordinates while keeping the center the same
+        cx, cy = x1 + width / 2, y1 + height / 2
+        new_x1 = max(cx - new_width / 2, 0)
+        new_y1 = max(cy - new_height / 2, 0)
+        new_x2 = max(cx + new_width / 2, 0)
+        new_y2 = max(cy + new_height / 2, 0)
 
-            frameno = 0
+        return [new_x1, new_y1, new_x2, new_y2]
 
-            while cap.isOpened():
-                try:
-                    ret, frame = cap.read()
-                    if not ret or frameno == 668:
-                        break
+    def convert_bbox_format(self, bboxes):
+        """
+        Convert bounding boxes from [[x1, y1, x2, y2]] format to [[[x1, y1], [x2, y1], [x2, y2], [x1, y2]]] format,
+        after increasing the area lengthwise by 10%.
+        
+        Parameters:
+        bboxes (list): A list of bounding boxes, each in [x1, y1, x2, y2] format.
+        
+        Returns:
+        list: A list of bounding boxes, each in [[[x1, y1], [x2, y1], [x2, y2], [x1, y2]]] format as numpy arrays with dtype float32.
+        """
+        converted_bboxes = []
+        for bbox in bboxes:
+            # increased_bbox = self.increase_bbox_area_lengthwise(bbox)
+            x1, y1, x2, y2 = bbox
+            box = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+            converted_bboxes.append(box)
+        return converted_bboxes
 
-                    frameno += 1
-                    print(f"[INFO] {datetime.datetime.now()}: working with frame: {frameno} ")
-                    # Apply detection model on the frame
+    def draw_box_txt_fine(self,img_size, box, txt, font_path="./models/paddleocr/doc/fonts/simfang.ttf"):
+        box_height = int(
+            math.sqrt((box[0][0] - box[3][0]) ** 2 + (box[0][1] - box[3][1]) ** 2)
+        )
+        box_width = int(
+            math.sqrt((box[0][0] - box[1][0]) ** 2 + (box[0][1] - box[1][1]) ** 2)
+        )
 
-                    st = time.time()
-                    boxes, class_names, scores = model(frame)
-                    print(f"[INFO] {datetime.datetime.now()}: time taken for text detection {time.time() - st } ")
+        if box_height > 2 * box_width and box_height > 30:
+            img_text = Image.new("RGB", (box_height, box_width), (255, 255, 255))
+            draw_text = ImageDraw.Draw(img_text)
+            if txt:
+                font = self.create_font(txt, (box_height, box_width), font_path)
+                draw_text.text([0, 0], txt, fill=(0, 0, 0), font=font)
+            img_text = img_text.transpose(Image.ROTATE_270)
+        else:
+            img_text = Image.new("RGB", (box_width, box_height), (255, 255, 255))
+            draw_text = ImageDraw.Draw(img_text)
+            if txt:
+                font = self.create_font(txt, (box_width, box_height), font_path)
+                draw_text.text([0, 0], txt, fill=(0, 0, 0), font=font)
 
-                    ### filtering and plotting results on image
-                    res_img = plot_results(frame, boxes, class_names, scores, det_th, classes, ocr_model, out_crop_path, file[:-4] + f'_frame_{frameno}', results_file)
-                    # res_img = cv2.putText(res_img, f"frame:{frameno}", (500,500), cv2.FONT_HERSHEY_SIMPLEX, 2, (0,255,0), 2)
+        pts1 = np.float32(
+            [[0, 0], [box_width, 0], [box_width, box_height], [0, box_height]]
+        )
+        pts2 = np.array(box, dtype=np.float32)
+        M = cv2.getPerspectiveTransform(pts1, pts2)
 
-                    if output_folder:
-                        out.write(res_img)  # Save processed frame
-                        if lowfpsvid:
-                            outlow.write(res_img)
-                except Exception as e:
-                    cap.release()
-                    out.release()
-                    if lowfpsvid:
-                        outlow.release()
-                    exit()
-
-            # Release resources
-            cap.release()
-            if output_folder:
-                out.release()
-                if lowfpsvid:
-                    outlow.release()
-                print(f"[INFO] {datetime.datetime.now()}: result video saved at {output_path}\n ")
-
-    print(f"[INFO] {datetime.datetime.now()}: --- VIDEO INFERENCING COMPLETED ---")
-
-
-def main(params):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[INFO] {datetime.datetime.now()}: device available: {device}  ------xxxxxxxxx \n")
-
-    ### checking directory
-    dirchecks(params["image_dir"] if params["image_dir"] is not None else params["video_dir"])
-
-    ### loading the model
-    if params["use_model"] == "fasterrcnn":
-        model = FasterRCNN(model_weights=params["models"]["fasterrcnn"]["model_weights"], classes=params["classes"], device=device, detection_thr=params["models"]["fasterrcnn"]["det_th"])
-        detection_thr = params["models"]["fasterrcnn"]["det_th"]
-    elif params["use_model"] == "yolov8":
-        model = YoloV8(model_weights=params["models"]["yolov8"]["model_weights"], classes=params["classes"], device=device, score_thresh=params["models"]["yolov8"]["det_th"], iou_thres=params["models"]["yolov8"]["iou_th"])
-        detection_thr = params["models"]["yolov8"]["det_th"]
-
-    print(f"[INFO] {datetime.datetime.now()}: Text Detection Model Loading Completed!!!\n")
-
-    # if params["use_ocr_model"] == "trocr":
-    #     ocr_model = TROCR(model_weights=params["ocr_models"]["trocr"]["model_weights"], MODEL_NAME=params["ocr_models"]["trocr"]["MODEL_NAME"])
-    if params["use_ocr_model"] == "paddleocr":
-        ocr_model = PaddleOCRx(model_weights=params["ocr_models"]["paddleocr"]["model_weights"])
-    else:
-        ocr_model = None
-
-    print(f"[INFO] {datetime.datetime.now()}: OCR Model Loading Completed!!!\n" if params["use_ocr_model"] is not None else f"[INFO] {datetime.datetime.now()}: NO OCR model!!! working with text detection only \n")
-
-    ##### ------------------------ INFER ON IMAGES OR VIDS -------------------
-    if params["image_dir"] is not None:  ### if image run this
-        start = time.time()
-        img_inferencing(params["image_dir"], out_path=params["output_dir"], ocr_model=ocr_model, model=model, det_th=detection_thr, custom_name=params["custom_name"], classes=params["classes"])
-        print(f"total time taken: {time.time() - start}")
-    elif params["video_dir"] is not None:
-        vid_inferencing(params["video_dir"], params["output_dir"], model, detection_thr, params["custom_name"], params["classes"], ocr_model=ocr_model, lowfpsvid=params["lowfpsvid"])
-    else:
-        print(f"[INFO] {datetime.datetime.now()}: no img path or vid path given. Exiting\n")
-        sys.exit(1)
+        img_text = np.array(img_text, dtype=np.uint8)
+        img_right_text = cv2.warpPerspective(
+            img_text,
+            M,
+            img_size,
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255),
+        )
+        return img_right_text
 
 
-# Driver code
-if __name__ == '__main__':
+    def create_font(self,txt, sz, font_path="./models/paddleocr/doc/fonts/simfang.ttf"):
+        font_size = int(sz[1] * 0.99)
+        font = ImageFont.truetype(font_path, font_size, encoding="utf-8")
+        if int(PIL.__version__.split(".")[0]) < 10:
+            length = font.getsize(txt)[0]
+        else:
+            length = font.getlength(txt)
+
+        if length > sz[0]:
+            font_size = int(font_size * sz[0] / length)
+            font = ImageFont.truetype(font_path, font_size, encoding="utf-8")
+        return font
+
+
+
+def main():
     try:
         with open('./model_jsons/paramx.json', 'r') as f:
             params = json.load(f)
-
-        print(f"[INFO] {datetime.datetime.now()}: ------------- PROCESS STARTED -------------\n\n\n params:\n{params}\n\n")
-        main(params)
-        print(f"[INFO] {datetime.datetime.now()}: ------------- PROCESS COMPLETED -------------\n\n\n")
-
+        # Initialize the OCR model with the result path
+        ocr_modelx = OCR(params,logger=logger,res_path="./results")
     except:
-        print(f"\n [ERROR] {datetime.datetime.now()} \n ")
+        print(f"\n [ERROR] {datetime.datetime.now()} OCR model loading failed!!!\n ")
         traceback.print_exception(*sys.exc_info())
+        sys.exit(1)
+    
+    image_dir = params["image_dir"]
+
+    
+    ### reading images and inferencing
+    for im_name in tqdm(os.listdir(image_dir)):        
+        img_path = os.path.join(image_dir, im_name)
+        print(f"[INFO]{datetime.datetime.now()} working with img_path:{img_path}\n ")
+
+        img = cv2.imread(img_path)
+        res_txt, result_img_path = ocr_modelx(img,img_name=im_name)
+
+if __name__ == '__main__':
+    print(f"[INFO]{datetime.datetime.now()} ---------- PROCESS STARTED ----------\n ")
+    main()
+    print(f"[INFO]{datetime.datetime.now()} ---------- PROCESS COMPLETED ----------\n ")
+
+
